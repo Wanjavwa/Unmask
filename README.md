@@ -188,7 +188,7 @@ Unmask was built to reduce these harms by:
 
 - Support for deepfake video and audio verification
 - Increase dataset to include other POC groups
-- Clouad-deployable backend
+- Cloud-deployable backend
 - Web browser + social media extension and partnerships
 
 ---
