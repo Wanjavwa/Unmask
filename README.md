@@ -148,9 +148,11 @@ Uploads an image and returns a deepfake detection response.
 
 ---
 
-## 🎬 Demo
+## 🎬 Video Walkthrough
 
-[Insert GIF demo here - showing app flow: image selection → upload → result display → share]
+<img src="https://raw.githubusercontent.com/Wanjavwa/Unmask/main/public/walkthroughdemo1.gif"
+title="Unmask App Demo Walkthrough"
+alt="Unmask App Demo Walkthrough" />
 
 ---
 
