@@ -7,16 +7,38 @@ Unmask deepfake detector uses an ensemble of three models:
 - Loads all models once at startup (same pattern for each)
 - Runs on GPU if available, otherwise CPU
 - Accepts a PIL Image; uses OpenCV for face detection and same face crop for all models
-- Weighted ensemble: raw_prob = 0.45*effb4 + 0.45*xception + 0.10*fairness, then prob_fake = _calibrate(raw_prob)
+- Weighted ensemble + fairness-aware fusion, then prob_fake = _calibrate(raw_prob)
 - Bernoulli entropy from all three models; avg_entropy used for novelty detection (low prob + low entropy = "Possibly AI-generated (novel pattern)")
-- Finally returns (label, confidence, explanation, disclaimer, debug_scores) with avg_entropy in debug_scores when DEBUG_SCORES=1
+- Returns evaluation via evaluation.py (user explanation + calibrated confidence; developer report when DEBUG_SCORES=1)
 """
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
 from typing import Any, Tuple
+
+from diagnostics import debug_enabled, log_stage
+from evaluation import (
+    ModelOutputs,
+    PreprocessInfo,
+    THRESHOLD_FAKE,
+    THRESHOLD_REAL,
+    build_evaluation,
+)
+
+# Deterministic inference when UNMASK_DETERMINISTIC=1
+_DETERMINISTIC = os.environ.get("UNMASK_DETERMINISTIC", "").strip() in ("1", "true", "yes")
+if _DETERMINISTIC:
+    try:
+        import torch.backends.cudnn as cudnn
+        cudnn.deterministic = True
+        cudnn.benchmark = False
+    except Exception:
+        pass
+
+logging.basicConfig(level=logging.INFO if debug_enabled() else logging.WARNING)
 
 import numpy as np
 import torch
@@ -64,12 +86,6 @@ _FAIRNESS_WEIGHTS_PATHS = (
 _FAIRNESS_SIZE = 224
 _FAIRNESS_MEAN = (0.485, 0.456, 0.406)
 _FAIRNESS_STD = (0.229, 0.224, 0.225)
-
-# Ensemble weights ratio distribution
-WEIGHT_EFFB4 = 0.45
-WEIGHT_XCEPTION = 0.45
-WEIGHT_FAIRNESS = 0.10
-
 
 class EfficientNetB4Deepfake(nn.Module):
 
@@ -402,28 +418,18 @@ def _preprocess_fairness(face_img: Image.Image) -> torch.Tensor:
     return tensor.unsqueeze(0)
 
 
-def _calibrate(p: float) -> float:
-    # Calibrate probability to be between 0.01 and 0.99 (reduces overconfident extremes)
-    return float(min(max((p - 0.05) / 0.9, 0.01), 0.99))
-
-
-def _clamp_confidence(p: float) -> float:
-    """Ensure confidence is always between 0 and 1, never negative."""
-    return float(min(max(p, 0.0), 1.0))
-
-
-def _bernoulli_entropy(p: float, eps: float = 1e-6) -> float:
-    # This func measures prediction uncertainty with a bernoulli distribution 
-    p = float(min(max(p, eps), 1.0 - eps))
-    return float(-(p * np.log(p) + (1.0 - p) * np.log(1.0 - p)))
-
-
 @torch.inference_mode()
-def predict_deepfake(image: Image.Image) -> Tuple[str, float, str, str, dict[str, Any]]:
+def predict_deepfake(image: Image.Image) -> Tuple[str, float, float, str, str, dict[str, Any]]:
     """
-    Run ensemble inference and return label, confidence, explanation, disclaimer, and debug_scores.
+    Run ensemble inference.
+    Returns: label, prob_fake, overall_confidence, user_explanation, disclaimer, debug_scores.
     """
+    if _DETERMINISTIC:
+        torch.manual_seed(42)
+        np.random.seed(42)
+
     model_effb4, model_xception, model_fairness, device, detector = _load_once()
+    log_stage("device", {"device": str(device), "deterministic": _DETERMINISTIC})
 
     if hasattr(image, "load"):
         image.load()
@@ -435,13 +441,23 @@ def predict_deepfake(image: Image.Image) -> Tuple[str, float, str, str, dict[str
 
     if bbox is not None:
         face = _crop_with_margin(image, bbox)
-        face_note = "Detected a face and analyzed the cropped face region."
+        face_bbox = {"x": bbox[0], "y": bbox[1], "w": bbox[2], "h": bbox[3]}
+        face_detected = True
     else:
         face = _center_square_crop(image)
-        face_note = "No clear face detected; analyzed a center crop of the image."
+        face_bbox = None
+        face_detected = False
+
+    log_stage("preprocess", {
+        "face_bbox": face_bbox,
+        "face_size": [face.width, face.height],
+        "effb4_xception": {"size": INPUT_RESOLUTION, "mean": NORM_MEAN, "std": NORM_STD},
+        "fairness": {"size": _FAIRNESS_SIZE, "mean": _FAIRNESS_MEAN, "std": _FAIRNESS_STD},
+    })
 
     # EffB4 and Xception: same 256x256 preprocessing
     x = _preprocess(face).to(device)
+    log_stage("tensor_shapes", {"effb4_xception_input": list(x.shape)})
     logits_effb4 = model_effb4(x)[0]
     prob_effb4 = float(torch.softmax(logits_effb4, dim=0)[1].item())
     logits_xception = model_xception(x)[0]
@@ -449,55 +465,54 @@ def predict_deepfake(image: Image.Image) -> Tuple[str, float, str, str, dict[str
 
     # Fairness model: same face crop, 224x224 ImageNet normalization
     x_fairness = _preprocess_fairness(face).to(device)
+    log_stage("tensor_shapes", {"fairness_input": list(x_fairness.shape)})
     logits_fairness = model_fairness(x_fairness)[0]
     prob_fairness = float(torch.softmax(logits_fairness, dim=0)[1].item())
 
-    # Weighted ensemble (three models): 0.45 * effb4 + 0.45 * xception + 0.10 * fairness
-    raw_prob = (
-        WEIGHT_EFFB4 * prob_effb4
-        + WEIGHT_XCEPTION * prob_xception
-        + WEIGHT_FAIRNESS * prob_fairness
+    log_stage("raw_model_outputs", {
+        "logits_effb4": logits_effb4.detach().cpu().tolist(),
+        "logits_xception": logits_xception.detach().cpu().tolist(),
+        "logits_fairness": logits_fairness.detach().cpu().tolist(),
+        "prob_fake_class_index": 1,
+        "prob_effb4": prob_effb4,
+        "prob_xception": prob_xception,
+        "prob_fairness": prob_fairness,
+    })
+
+    preprocess = PreprocessInfo(
+        face_detected=face_detected,
+        face_note=(
+            "Detected a face and analyzed the cropped face region."
+            if face_detected
+            else "No clear face detected; analyzed a center crop of the image."
+        ),
+        face_bbox=face_bbox,
+        face_size=(face.width, face.height),
     )
-    prob_fake = _calibrate(raw_prob)
-    confidence = _clamp_confidence(prob_fake)
-
-    # Entropy from all three models (uncertainty; low entropy = confident prediction)
-    ent_effb4 = _bernoulli_entropy(prob_effb4)
-    ent_xception = _bernoulli_entropy(prob_xception)
-    ent_fairness = _bernoulli_entropy(prob_fairness)
-    avg_entropy = (ent_effb4 + ent_xception + ent_fairness) / 3.0
-
-    # Novelty: low prob_fake and low entropy can indicate confident-but-wrong bypass patterns
-    novelty = (prob_fake < 0.2) and (avg_entropy < 0.15)
-
-    if novelty:
-        label = "Possibly AI-generated (novel pattern)"
-    elif prob_fake >= 0.6:
-        label = "Likely deepfake"
-    elif prob_fake <= 0.4:
-        label = "Likely real"
-    else:
-        label = "Uncertain"
-
-    # Confidence note: do all three models agree on real vs fake (same side of 0.5)?
-    agree = (prob_effb4 >= 0.5) == (prob_xception >= 0.5) == (prob_fairness >= 0.5)
-    confidence_note = "High confidence" if agree else "Mixed signals detected"
-
-    disclaimer = (
-        "Unmask provides probabilistic analysis and may be affected by dataset bias, "
-        "lighting, and image quality. It should be used as a decision-support aid, "
-        "not as definitive proof."
+    models = ModelOutputs(
+        prob_effb4=prob_effb4,
+        prob_xception=prob_xception,
+        prob_fairness=prob_fairness,
+        logits_effb4=logits_effb4.detach().cpu().tolist(),
+        logits_xception=logits_xception.detach().cpu().tolist(),
+        logits_fairness=logits_fairness.detach().cpu().tolist(),
     )
-    explanation = (
-        f"{face_note} with {confidence_note} "
-        f"(ensemble={prob_fake:.3f}, effb4={prob_effb4:.3f}, xception={prob_xception:.3f}, "
-        f"fairness={prob_fairness:.3f}, avg_entropy={avg_entropy:.3f})."
+
+    result = build_evaluation(models, preprocess)
+    debug_scores = result.developer_report["debug_scores"]
+    log_stage("evaluation", {
+        "label": result.label,
+        "prob_fake": result.prob_fake,
+        "confidence_level": result.confidence_level,
+        "fusion_mode": debug_scores.get("fusion_mode"),
+        **{k: debug_scores[k] for k in ("effb4", "xception", "fairness", "ensemble")},
+    })
+    log_stage("final", {"label": result.label, **debug_scores})
+    return (
+        result.label,
+        result.prob_fake,
+        result.overall_confidence,
+        result.user_explanation,
+        result.disclaimer,
+        result.developer_report,
     )
-    debug_scores: dict[str, Any] = {
-        "effb4": round(prob_effb4, 4),
-        "xception": round(prob_xception, 4),
-        "fairness": round(prob_fairness, 4),
-        "ensemble": round(prob_fake, 4),
-        "avg_entropy": round(avg_entropy, 4),
-    }
-    return label, confidence, explanation, disclaimer, debug_scores

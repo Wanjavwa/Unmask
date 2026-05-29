@@ -59,6 +59,119 @@ const COLORS = {
   aiGlow: "rgba(239,68,68,0.5)",
 };
 
+function fmtPct(v) {
+  if (v == null || !Number.isFinite(v)) return "—";
+  return `${Math.round(v * 100)}%`;
+}
+
+function fmtNum(v, digits = 3) {
+  if (v == null || !Number.isFinite(v)) return "—";
+  return v.toFixed(digits);
+}
+
+function MetricRow({ label, value, hint }) {
+  return (
+    <View style={styles.metricRow}>
+      <Text style={styles.metricLabel}>{label}</Text>
+      <View style={styles.metricValueCol}>
+        <Text style={styles.metricValue}>{value}</Text>
+        {hint ? <Text style={styles.metricHint}>{hint}</Text> : null}
+      </View>
+    </View>
+  );
+}
+
+function ModelBreakdown({ metrics }) {
+  if (!metrics) {
+    return (
+      <View style={styles.metricsPanel}>
+        <Text style={styles.metricsTitle}>Model breakdown</Text>
+        <Text style={styles.metricsUnavailable}>
+          Per-model scores were not returned. Restart the backend on port 8011, then
+          scan again.
+        </Text>
+      </View>
+    );
+  }
+
+  const { models, entropy, ensemble, disagreement, decision } = metrics;
+  const tier = disagreement.tier
+    ? disagreement.tier.charAt(0).toUpperCase() + disagreement.tier.slice(1)
+    : "—";
+
+  return (
+    <View style={styles.metricsPanel}>
+      <Text style={styles.metricsTitle}>Model breakdown</Text>
+
+      <Text style={styles.metricsSection}>Fake probability (per model)</Text>
+      <MetricRow label="EfficientNet-B4" value={fmtPct(models.efficientnetB4)} />
+      <MetricRow label="Xception" value={fmtPct(models.xception)} />
+      <MetricRow
+        label="Fairness"
+        value={fmtPct(models.fairness)}
+        hint="calibration only"
+      />
+
+      <Text style={styles.metricsSection}>Entropy (uncertainty)</Text>
+      <MetricRow label="EfficientNet-B4" value={fmtNum(entropy.efficientnetB4)} />
+      <MetricRow label="Xception" value={fmtNum(entropy.xception)} />
+      <MetricRow label="Fairness" value={fmtNum(entropy.fairness)} />
+      <MetricRow label="Average" value={fmtNum(entropy.average)} />
+
+      <Text style={styles.metricsSection}>Ensemble</Text>
+      <MetricRow label="Weighted mean" value={fmtPct(ensemble.weightedMean)} />
+      <MetricRow
+        label="Calibrated (display)"
+        value={fmtPct(ensemble.calibratedProbFake)}
+      />
+      <MetricRow
+        label="Main detectors avg"
+        value={fmtPct(ensemble.probFakeMain)}
+      />
+      <MetricRow
+        label="Classification prob"
+        value={fmtPct(ensemble.classificationProb)}
+        hint="used for label thresholds"
+      />
+      {ensemble.fusionMode ? (
+        <MetricRow label="Fusion" value={ensemble.fusionMode} />
+      ) : null}
+
+      <Text style={styles.metricsSection}>Main detector disagreement</Text>
+      <MetricRow label="Spread" value={fmtNum(disagreement.spread, 2)} />
+      <MetricRow label="Tier" value={tier} />
+      <MetricRow
+        label="Agreement score"
+        value={fmtNum(disagreement.agreementScore, 2)}
+      />
+      <MetricRow
+        label="Direction consistent"
+        value={
+          disagreement.mainDirectionConsistent === true
+            ? "Yes"
+            : disagreement.mainDirectionConsistent === false
+              ? "No"
+              : "—"
+        }
+        hint="moderate tier only"
+      />
+      {disagreement.mainAvg != null ? (
+        <MetricRow label="Main avg (raw)" value={fmtPct(disagreement.mainAvg)} />
+      ) : null}
+
+      {decision.reason ? (
+        <>
+          <Text style={styles.metricsSection}>Decision</Text>
+          <MetricRow label="Reason" value={decision.reason} />
+        </>
+      ) : null}
+      {metrics.policyVersion ? (
+        <Text style={styles.metricsPolicy}>Policy v{metrics.policyVersion}</Text>
+      ) : null}
+    </View>
+  );
+}
+
 // ─── Layout constants (responsive + consistent) ──────────────────────────────
 const SPACING = 16;
 const RADIUS = 22;
@@ -354,8 +467,15 @@ export default function App() {
         setVerification({
           label: res.label,
           confidence: res.confidence,
+          confidenceLevel: res.confidenceLevel,
+          analysisReliable: res.analysisReliable,
+          probFake: res.probFake,
+          agreementScore: res.agreementScore,
+          probFakeMain: res.probFakeMain,
+          verdictStrength: res.verdictStrength,
           explanation: res.explanation || "",
           disclaimer: res.disclaimer,
+          metrics: res.analysisDetails,
         });
         resultShimmer.setValue(0);
         resultBadgePulse.setValue(1);
@@ -381,7 +501,7 @@ export default function App() {
           }).start();
         }, 200);
         Animated.timing(confidenceBarScale, {
-          toValue: res.confidence,
+          toValue: res.probFake ?? res.confidence,
           duration: duration(800),
           useNativeDriver: true,
         }).start();
@@ -817,18 +937,24 @@ export default function App() {
                   <Animated.View
                     style={[
                       styles.resultBadge,
+                      verification.label === "Likely authentic" ||
                       verification.label === "Likely real"
                         ? styles.resultBadgeReal
-                        : styles.resultBadgeAi,
+                        : verification.label === "Likely deepfake"
+                          ? styles.resultBadgeAi
+                          : styles.resultBadgeUncertain,
                       { transform: [{ scale: resultBadgePulse }] },
                     ]}
                   >
                     <Text
                       style={[
                         styles.resultBadgeText,
+                        verification.label === "Likely authentic" ||
                         verification.label === "Likely real"
                           ? styles.resultBadgeTextReal
-                          : styles.resultBadgeTextAi,
+                          : verification.label === "Likely deepfake"
+                            ? styles.resultBadgeTextAi
+                            : styles.resultBadgeTextUncertain,
                       ]}
                     >
                       {verification.label}
@@ -853,8 +979,19 @@ export default function App() {
                     </Animated.View>
                   </View>
                   <Text style={styles.confidenceLabel}>
-                    Confidence: {Math.round((verification.confidence ?? 0) * 100)}%
+                    Fake probability: {Math.round((verification.probFake ?? 0) * 100)}%
+                    {" · "}
+                    Confidence: {verification.confidenceLevel ?? "Inconclusive"}
+                    {verification.label === "Mixed signals"
+                      ? " (main detectors conflict across 50%)"
+                      : verification.analysisReliable === false &&
+                          verification.label !== "Likely authentic" &&
+                          verification.label !== "Likely deepfake"
+                        ? " (no firm verdict)"
+                        : ""}
                   </Text>
+
+                  <ModelBreakdown metrics={verification.metrics} />
 
                   <Text style={styles.explanation}>{verification.explanation}</Text>
 
@@ -1257,6 +1394,14 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.8,
     shadowRadius: 12,
   },
+  resultBadgeUncertain: {
+    borderColor: "rgba(148,163,184,0.7)",
+    backgroundColor: "rgba(148,163,184,0.15)",
+    shadowColor: "rgba(148,163,184,0.4)",
+    shadowOffset: { width: 0, height: 0 },
+    shadowOpacity: 0.6,
+    shadowRadius: 10,
+  },
   resultBadgeText: {
     fontFamily: "Exo2_600SemiBold",
     fontSize: 14,
@@ -1267,6 +1412,9 @@ const styles = StyleSheet.create({
   },
   resultBadgeTextAi: {
     color: "#b91c1c",
+  },
+  resultBadgeTextUncertain: {
+    color: "#475569",
   },
   confidenceBarWrap: {
     width: "100%",
@@ -1288,24 +1436,99 @@ const styles = StyleSheet.create({
     borderRadius: 4,
   },
   confidenceLabel: {
-    fontFamily: "Inter_500Medium",
-    fontSize: 12,
-    color: COLORS.textSecondary,
+    fontFamily: "Exo2_600SemiBold",
+    fontSize: 13,
+    color: "#0f172a",
     marginTop: 8,
+    lineHeight: 20,
+  },
+  metricsPanel: {
+    width: "100%",
+    marginTop: 16,
+    paddingVertical: 16,
+    paddingHorizontal: 16,
+    borderRadius: 12,
+    backgroundColor: "#e8edf4",
+    borderWidth: 1,
+    borderColor: "rgba(15, 22, 41, 0.18)",
+  },
+  metricsTitle: {
+    fontFamily: "Exo2_600SemiBold",
+    fontSize: 16,
+    color: "#0b0d1a",
+    letterSpacing: 0.3,
+    marginBottom: 12,
+    textAlign: "center",
+  },
+  metricsSection: {
+    fontFamily: "Exo2_600SemiBold",
+    fontSize: 12,
+    color: "#1e293b",
+    marginTop: 12,
+    marginBottom: 8,
+    textTransform: "uppercase",
+    letterSpacing: 0.5,
+  },
+  metricRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "flex-start",
+    paddingVertical: 7,
+    borderBottomWidth: 1,
+    borderBottomColor: "rgba(15, 22, 41, 0.12)",
+  },
+  metricLabel: {
+    fontFamily: "Exo2_600SemiBold",
+    fontSize: 13,
+    color: "#0f172a",
+    flex: 1,
+    paddingRight: 8,
+  },
+  metricValueCol: {
+    flexShrink: 1,
+    alignItems: "flex-end",
+    maxWidth: "55%",
+  },
+  metricValue: {
+    fontFamily: "Exo2_600SemiBold",
+    fontSize: 14,
+    color: "#0b0d1a",
+    textAlign: "right",
+  },
+  metricHint: {
+    fontFamily: "Inter_500Medium",
+    fontSize: 11,
+    color: "#475569",
+    marginTop: 3,
+    textAlign: "right",
+  },
+  metricsPolicy: {
+    fontFamily: "Inter_500Medium",
+    fontSize: 11,
+    color: "#334155",
+    marginTop: 12,
+    textAlign: "center",
+  },
+  metricsUnavailable: {
+    fontFamily: "Inter_500Medium",
+    fontSize: 13,
+    color: "#1e293b",
+    textAlign: "center",
+    lineHeight: 20,
   },
   explanation: {
-    fontFamily: "Inter_400Regular",
+    fontFamily: "Inter_500Medium",
     fontSize: 13,
-    color: COLORS.textSecondary,
+    color: "#1e293b",
     textAlign: "center",
     marginTop: 14,
     lineHeight: 20,
     paddingHorizontal: 8,
   },
   disclaimer: {
-    fontFamily: "Inter_400Regular",
+    fontFamily: "Inter_500Medium",
     fontSize: 11,
-    color: COLORS.textMuted,
+    color: "#475569",
     textAlign: "center",
     marginTop: 12,
     lineHeight: 16,

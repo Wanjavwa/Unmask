@@ -1,6 +1,12 @@
 @echo off
+
 cd /d "%~dp0"
-echo Starting Unmask backend at http://127.0.0.1:8000
-echo API docs: http://127.0.0.1:8000/docs
+
+echo Starting Unmask backend on port 8011 (use mobile/services/api.js BACKEND_PORT=8011)
+
+echo Health: http://127.0.0.1:8011/health
+
 echo.
-uvicorn app:app --reload --host 127.0.0.1 --port 8000
+
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0start-backend.ps1"
+
