@@ -1,14 +1,26 @@
 """
-Unmask evaluation policy v3.2 — main-detector spread + directional gate.
+================================================================================
+EVALUATION.PY — Policy engine (labels, ensemble math, explanations)
+================================================================================
 
-Spread = |EffB4 − Xception| only (fairness excluded).
+ROLE IN THE SYSTEM
+------------------
+Receives three model probabilities + face metadata from model.py and returns:
+  - Final user-facing label (Likely authentic, Likely deepfake, Mixed signals, …)
+  - Calibrated prob_fake (shown in UI bar)
+  - overall_confidence + confidence_level string
+  - user_explanation, disclaimer, developer_report
 
+PIPELINE POSITION
+-----------------
+  model.py (raw probs)  →  evaluation.build_evaluation()  →  app.py (JSON)
+
+Policy v3.3 summary:
+  spread = |EffB4 − Xception| only (fairness excluded).
   spread > 0.25 + models straddle 0.5 → Mixed signals.
-  Otherwise → calibrated weighted prob_fake, then:
+  Otherwise → calibrated weighted prob_fake:
       ≤ 35% Likely authentic | ≥ 65% Likely deepfake | else Inconclusive.
-  Same threshold path for low spread and for high spread when both agree direction.
-
-Confidence tiers (0.15 / 0.30) affect overall_confidence display only, not the label gate.
+  Confidence tiers (0.15 / 0.30) affect overall_confidence display only.
 """
 
 from __future__ import annotations
@@ -17,6 +29,12 @@ import math
 from dataclasses import dataclass, field
 from typing import Any
 
+# ==============================================================================
+# POLICY CONSTANTS — thresholds, weights, spread gates
+# ==============================================================================
+# These numbers define v3.3 behavior. Changing them changes labels without
+# retraining any neural network.
+# ==============================================================================
 WEIGHT_EFFB4 = 0.40
 WEIGHT_XCEPTION = 0.40
 WEIGHT_FAIRNESS = 0.20
@@ -58,6 +76,14 @@ GATED_LABELS = frozenset({
 })
 
 
+# ==============================================================================
+# DATA CONTRACTS — what flows between model.py and this module
+# ==============================================================================
+# ModelOutputs: softmax fake-class probabilities from each network.
+# PreprocessInfo: whether OpenCV found a face (affects labels + confidence).
+# DisagreementMetrics / EnsembleResult: internal spread + fusion state.
+# EvaluationResult: final bundle returned to model.py → app.py.
+# ==============================================================================
 @dataclass
 class ModelOutputs:
     prob_effb4: float
@@ -138,6 +164,13 @@ class EvaluationResult:
     developer_report: dict[str, Any] = field(default_factory=dict)
 
 
+# ==============================================================================
+# SMALL MATH HELPERS — calibration, entropy, threshold comparisons
+# ==============================================================================
+# calibrate_probability: maps raw [0,1] to display range (linear stretch).
+# bernoulli_entropy: uncertainty of a single model's fake probability.
+# _prob_indicates_*: label thresholds with 4-decimal rounding for stability.
+# ==============================================================================
 def calibrate_probability(p: float) -> float:
     return float(min(max((p - 0.05) / 0.9, 0.01), 0.99))
 
@@ -183,6 +216,13 @@ def weighted_ensemble(prob_effb4: float, prob_xception: float, prob_fairness: fl
     )
 
 
+# ==============================================================================
+# MAIN-DETECTOR DISAGREEMENT — spread tier and directional consistency
+# ==============================================================================
+# compute_disagreement(): spread = |EffB4 - Xception|; fairness only logged.
+# spread_triggers_mixed_gate / main_detectors_same_direction: Mixed signals gate.
+# Used for: Mixed signals gate, confidence factors, UI breakdown.
+# ==============================================================================
 def compute_disagreement(
     prob_effb4: float, prob_xception: float, prob_fairness: float
 ) -> DisagreementMetrics:
@@ -221,6 +261,14 @@ def compute_disagreement(
     )
 
 
+# ==============================================================================
+# ENSEMBLE FUSION — weighted mean + optional fairness nudge
+# ==============================================================================
+# fuse_ensemble(): 40/40/20 blend; 10% fairness nudge only when spread < 0.15.
+# apply_disagreement_to_display_probability(): shrink toward 50% if spread ≥ 0.15.
+# classification_probability(): returns calibrated prob_fake for label thresholds.
+# build_ensemble(): orchestrates the above → EnsembleResult.
+# ==============================================================================
 def fuse_ensemble(
     prob_effb4: float,
     prob_xception: float,
@@ -307,6 +355,12 @@ def build_ensemble(models: ModelOutputs) -> EnsembleResult:
     )
 
 
+# ==============================================================================
+# OVERALL CONFIDENCE — reliability score for UI "Confidence: High/Low/…"
+# ==============================================================================
+# Multiplicative factors from spread, face, entropy, disagreement tier, fairness gap.
+# v3.3: does NOT block Likely authentic/deepfake — only affects confidence_level().
+# ==============================================================================
 def overall_confidence(
     disagreement: DisagreementMetrics,
     face_detected: bool,
@@ -333,9 +387,15 @@ def overall_confidence(
     fusion_factor = 0.97 if fusion_mode.startswith("fairness_nudge") else 1.0
 
     raw = agreement * face_factor * entropy_factor * disagreement_factor * fairness_factor * fusion_factor
-    return float(min(max(raw, 0.0), 1.0))
+    return float(min(max(raw, 0.0), 1.0)    )
 
 
+# ==============================================================================
+# RELIABILITY ASSESSMENT — logging + can_issue_strong_label flag
+# ==============================================================================
+# Records issues (no face, spread above gate, etc.). can_strong is true when
+# face present and not mixed_blocked — used in developer_report only in v3.3.
+# ==============================================================================
 def assess_reliability(
     preprocess: PreprocessInfo,
     disagreement: DisagreementMetrics,
@@ -388,6 +448,13 @@ def _tentative_lean(prob_fake: float) -> str:
     return "neutral"
 
 
+# ==============================================================================
+# LABEL DECISION — face → Mixed gate → calibrated prob thresholds
+# ==============================================================================
+# decide_label(): the authoritative verdict logic for v3.3.
+# Order: no face → Mixed (spread>0.25 & straddle 0.5) → novelty → 65%/35% → Inconclusive.
+# confidence_level(): maps overall_confidence to Very High / High / … for UI.
+# ==============================================================================
 def decide_label(
     prob_fake: float,
     class_prob: float,
@@ -430,6 +497,12 @@ def confidence_level(overall: float, label: str) -> str:
     return "Inconclusive"
 
 
+# ==============================================================================
+# USER-FACING TEXT — plain-language explanations per label
+# ==============================================================================
+# build_user_explanation(): one paragraph shown under the result badge.
+# Uses label + prob_fake + spread; avoids raw debug tokens in user text.
+# ==============================================================================
 def build_user_explanation(
     label: str,
     prob_fake: float,
@@ -494,6 +567,12 @@ def _pct(p: float) -> str:
     return f"{round(p * 100)}%"
 
 
+# ==============================================================================
+# DEVELOPER REPORT — full structured audit trail (optional in API)
+# ==============================================================================
+# build_developer_report(): pipeline steps, disagreement block, ensemble block,
+# decision_policy block. app.py flattens parts into analysis_details for mobile.
+# ==============================================================================
 def build_developer_report(
     models: ModelOutputs,
     preprocess: PreprocessInfo,
@@ -598,6 +677,16 @@ def _label_from_prob_threshold_only(prob_fake: float, novelty: bool) -> str:
     return LABEL_INCONCLUSIVE
 
 
+# ==============================================================================
+# ORCHESTRATOR — build_evaluation() ties everything together
+# ==============================================================================
+# Entry point from model.py. Steps:
+#   1. build_ensemble(models)
+#   2. entropy per model + overall_confidence
+#   3. assess_reliability + decide_label
+#   4. build_user_explanation + developer_report + debug_scores
+# Returns EvaluationResult consumed by model.predict_deepfake → app.py.
+# ==============================================================================
 def build_evaluation(models: ModelOutputs, preprocess: PreprocessInfo) -> EvaluationResult:
     ensemble = build_ensemble(models)
     prob_fake = ensemble.prob_fake

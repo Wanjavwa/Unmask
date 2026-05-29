@@ -1,15 +1,25 @@
 """
-Unmask deepfake detector uses an ensemble of three models:
-- EfficientNet-B4 (effnb4_best.pth)
-- XceptionNet (xception_best.pth)
-- Fairness head (ResNet18 real vs fake, trained on Black faces; fairness_head_best.pt)
+================================================================================
+MODEL.PY — Neural inference + face preprocessing
+================================================================================
 
-- Loads all models once at startup (same pattern for each)
-- Runs on GPU if available, otherwise CPU
-- Accepts a PIL Image; uses OpenCV for face detection and same face crop for all models
-- Weighted ensemble + fairness-aware fusion, then prob_fake = _calibrate(raw_prob)
-- Bernoulli entropy from all three models; avg_entropy used for novelty detection (low prob + low entropy = "Possibly AI-generated (novel pattern)")
-- Returns evaluation via evaluation.py (user explanation + calibrated confidence; developer report when DEBUG_SCORES=1)
+ROLE IN THE SYSTEM
+------------------
+Loads three PyTorch classifiers once, runs them on a face crop, then hands
+probabilities to evaluation.py for labels and explanations.
+
+Models:
+  - EfficientNet-B4 (DeepfakeBench weights) — 256×256, mean/std 0.5
+  - XceptionNet (DeepfakeBench weights)       — same preprocess as EffB4
+  - Fairness ResNet18                         — 224×224, ImageNet normalize
+
+PIPELINE POSITION
+-----------------
+  app.py  →  predict_deepfake()  →  build_evaluation() in evaluation.py
+
+Environment:
+  UNMASK_DEBUG=1        → verbose pipeline logs via diagnostics.py
+  UNMASK_DETERMINISTIC=1 → fixed seeds for reproducible tests
 """
 
 from __future__ import annotations
@@ -28,7 +38,9 @@ from evaluation import (
     build_evaluation,
 )
 
-# Deterministic inference when UNMASK_DETERMINISTIC=1
+# ==============================================================================
+# OPTIONAL DETERMINISTIC MODE — for regression tests
+# ==============================================================================
 _DETERMINISTIC = os.environ.get("UNMASK_DETERMINISTIC", "").strip() in ("1", "true", "yes")
 if _DETERMINISTIC:
     try:
@@ -40,6 +52,9 @@ if _DETERMINISTIC:
 
 logging.basicConfig(level=logging.INFO if debug_enabled() else logging.WARNING)
 
+# ==============================================================================
+# HEAVY IMPORTS — torch, PIL, OpenCV (after logging setup)
+# ==============================================================================
 import numpy as np
 import torch
 import torch.nn as nn
@@ -57,7 +72,12 @@ except Exception as e:
     raise RuntimeError("efficientnet-pytorch is required. Install efficientnet-pytorch.") from e
 
 
-# DeepfakeBench uses 256 + mean/std=0.5 for detectors
+# ==============================================================================
+# PREPROCESSING CONSTANTS + WEIGHT FILE PATHS
+# ==============================================================================
+# EffB4/Xception: 256×256, mean/std 0.5 (DeepfakeBench convention).
+# Fairness: 224×224, ImageNet mean/std. Paths searched in order until found.
+# ==============================================================================
 INPUT_RESOLUTION = 256
 NORM_MEAN = (0.5, 0.5, 0.5)
 NORM_STD = (0.5, 0.5, 0.5)
@@ -87,6 +107,13 @@ _FAIRNESS_SIZE = 224
 _FAIRNESS_MEAN = (0.485, 0.456, 0.406)
 _FAIRNESS_STD = (0.229, 0.224, 0.225)
 
+# ==============================================================================
+# NEURAL NETWORK ARCHITECTURES (checkpoint-compatible with DeepfakeBench / fairness)
+# ==============================================================================
+# EfficientNetB4Deepfake, XceptionNetDeepfake: main deepfake detectors.
+# FairnessResNet18: auxiliary head for calibration / fairness signal in ensemble.
+# Block/SeparableConv: Xception building blocks only — not used outside XceptionNet.
+# ==============================================================================
 class EfficientNetB4Deepfake(nn.Module):
 
     # This class serves as a minimal reproduction of DeepfakeBench EfficientNet-B4
@@ -246,6 +273,12 @@ class FairnessResNet18(nn.Module):
         return self.backbone(x)
 
 
+# ==============================================================================
+# SINGLETON MODEL CACHE — load once per process, thread-safe
+# ==============================================================================
+# _load_once(): loads EffB4, Xception, fairness, Haar cascade on first request.
+# Subsequent calls reuse globals (important for FastAPI — avoid reload per image).
+# ==============================================================================
 _lock = threading.Lock()
 _model_effb4: EfficientNetB4Deepfake | None = None
 _model_xception: XceptionNetDeepfake | None = None
@@ -336,6 +369,12 @@ def _load_once() -> tuple[
         return model_effb4, model_xception, model_fairness, device, detector
 
 
+# ==============================================================================
+# CHECKPOINT LOADING — DeepfakeBench .pth and fairness .pt formats
+# ==============================================================================
+# _load_checkpoint_into_model(): strips module./backbone. prefixes, strict=False.
+# Fairness checkpoint remapped to FairnessResNet18.backbone.* in _load_once().
+# ==============================================================================
 def _load_checkpoint_into_model(model: nn.Module, path: str) -> None:
     ckpt = torch.load(path, map_location="cpu")
     state_dict = ckpt
@@ -367,6 +406,13 @@ def _load_checkpoint_into_model(model: nn.Module, path: str) -> None:
         )
 
 
+# ==============================================================================
+# FACE DETECTION + CROPPING — OpenCV Haar, shared crop for all models
+# ==============================================================================
+# _detect_largest_face(): largest face bbox or None.
+# _crop_with_margin(): expand bbox 25% for context.
+# _center_square_crop(): fallback when no face (still analyzed, weaker reliability).
+# ==============================================================================
 def _detect_largest_face(image_rgb: np.ndarray, detector: "cv2.CascadeClassifier") -> tuple[int, int, int, int] | None:
     gray = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
     faces = detector.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
@@ -395,6 +441,12 @@ def _center_square_crop(img: Image.Image) -> Image.Image:
     return img.crop((left, top, left + side, top + side))
 
 
+# ==============================================================================
+# TENSOR PREPROCESSING — separate pipelines for main detectors vs fairness
+# ==============================================================================
+# _preprocess(): 256×256 tensor for EffB4 + Xception (one forward pass each).
+# _preprocess_fairness(): 224×224 ImageNet-normalized tensor for fairness head.
+# ==============================================================================
 def _preprocess(face_img: Image.Image) -> torch.Tensor:
     if face_img.mode != "RGB":
         face_img = face_img.convert("RGB")
@@ -418,11 +470,25 @@ def _preprocess_fairness(face_img: Image.Image) -> torch.Tensor:
     return tensor.unsqueeze(0)
 
 
+# ==============================================================================
+# MAIN ENTRY POINT — predict_deepfake(image)
+# ==============================================================================
+# Called by app.py on every /detect-image request.
+#
+# Steps:
+#   1. _load_once() — models + face detector on GPU/CPU
+#   2. Detect face → crop (or center crop)
+#   3. Forward pass ×3 → softmax class-1 = P(fake)
+#   4. build_evaluation(ModelOutputs, PreprocessInfo) in evaluation.py
+#   5. Return label, prob_fake, confidence, texts, developer_report
+#
+# Does NOT apply policy thresholds here — that is entirely evaluation.py.
+# ==============================================================================
 @torch.inference_mode()
 def predict_deepfake(image: Image.Image) -> Tuple[str, float, float, str, str, dict[str, Any]]:
     """
     Run ensemble inference.
-    Returns: label, prob_fake, overall_confidence, user_explanation, disclaimer, debug_scores.
+    Returns: label, prob_fake, overall_confidence, user_explanation, disclaimer, developer_report.
     """
     if _DETERMINISTIC:
         torch.manual_seed(42)

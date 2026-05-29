@@ -1,3 +1,27 @@
+"""
+================================================================================
+APP.PY — FastAPI HTTP layer for Unmask
+================================================================================
+
+ROLE IN THE SYSTEM
+------------------
+This file is the only public network interface for the backend. It does NOT run
+neural networks itself. It:
+
+  1. Accepts uploaded images from the mobile/web client.
+  2. Validates and decodes them with Pillow.
+  3. Calls model.predict_deepfake(image) — which runs inference + evaluation.
+  4. Maps the rich developer_report into a JSON response the UI can render.
+
+PIPELINE POSITION
+-----------------
+  Client (Expo)  →  app.py (/detect-image)  →  model.py  →  evaluation.py
+                         ↑ you are here
+
+Environment flags used here:
+  DEBUG_SCORES=1  → attach full debug_scores + developer_report to JSON.
+"""
+
 from __future__ import annotations
 
 import os
@@ -10,10 +34,26 @@ from PIL import Image, UnidentifiedImageError
 from model import predict_deepfake
 from evaluation import EVALUATION_POLICY_VERSION
 
-# DEBUG_SCORES=1 → full developer_report in API response
+# ==============================================================================
+# CONFIGURATION
+# ==============================================================================
+# DEBUG_SCORES=1 → mobile devs can inspect the full developer_report in the
+# API response. Production clients normally only receive analysis_details.
 DEBUG_SCORES_ENABLED = os.environ.get("DEBUG_SCORES", "").strip() == "1"
 
 
+# ==============================================================================
+# RESPONSE SHAPING — build_analysis_details()
+# ==============================================================================
+# model.py + evaluation.py produce a nested developer_report. The React
+# "Model breakdown" panel expects a flat, stable schema (models, entropy,
+# ensemble, disagreement, decision). This function is the adapter layer:
+# it copies fields from debug_scores and developer_report without re-running
+# any math.
+#
+# By itself: pure dict transformation, no ML.
+# In the system: called once per successful /detect-image request.
+# ==============================================================================
 def build_analysis_details(developer_report: dict) -> dict:
     """Structured scores for the client UI (models, entropy, spread, ensemble)."""
     debug = developer_report.get("debug_scores", {})
@@ -57,9 +97,21 @@ def build_analysis_details(developer_report: dict) -> dict:
     }
 
 
+# ==============================================================================
+# FASTAPI APPLICATION + CORS
+# ==============================================================================
+# CORS allows the Expo web app (localhost:8082) and physical devices to POST
+# images from a different origin. allow_origins=["*"] is permissive for local dev.
+# ==============================================================================
 app = FastAPI()
 
 
+# ==============================================================================
+# HEALTH CHECK — GET /health
+# ==============================================================================
+# Lets the client verify the server is up and which evaluation policy version
+# is loaded (e.g. "3.3"). Does not load GPU models.
+# ==============================================================================
 @app.get("/health")
 def health():
     return {
@@ -77,6 +129,20 @@ app.add_middleware(
 )
 
 
+# ==============================================================================
+# MAIN ENDPOINT — POST /detect-image
+# ==============================================================================
+# Flow:
+#   1. Read raw bytes from multipart upload.
+#   2. Open as PIL Image (reject corrupt files with 400).
+#   3. predict_deepfake(image) → label, prob_fake, confidence, texts, report.
+#   4. Build JSON: user-facing fields + analysis_details for model breakdown.
+#   5. Optionally attach full developer_report if DEBUG_SCORES=1.
+#
+# Errors:
+#   400 — empty or invalid image.
+#   500 — unexpected failure inside model/evaluation (wrapped with type name).
+# ==============================================================================
 @app.post("/detect-image")
 async def detect_image(file: UploadFile = File(...)):
     try:
